@@ -15,7 +15,7 @@ impl Default for Config {
         Self {
             underlying_shell: std::env::var("PSH_SHELL")
                 .unwrap_or_else(|_| "/bin/bash".to_string()),
-            ollama_url: "http://localhost:11434".to_string(),
+            ollama_url: "http://127.0.0.1:11434".to_string(),
             model: "gemma3:4b".to_string(),
             confirm_commands: true,
         }
