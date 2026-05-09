@@ -2,6 +2,7 @@ use rusqlite::{Connection, Result, params};
 use dirs::home_dir;
 use std::fs;
 
+#[derive(Clone)]
 pub struct Entry {
     pub cwd: String,
     pub command: String,

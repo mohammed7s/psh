@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::context::{Db, Entry};
+use crate::context::Entry;
 use serde_json::{json, Value};
 
-fn build_system_prompt(config: &Config, _recent: &[Entry]) -> String {
+fn build_system_prompt(config: &Config, recent: &[Entry]) -> String {
     let shell = std::path::Path::new(&config.underlying_shell)
         .file_name()
         .unwrap_or_default()
@@ -18,7 +18,7 @@ fn build_system_prompt(config: &Config, _recent: &[Entry]) -> String {
     let files: String = std::process::Command::new("ls")
         .arg("-1")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(20).collect::<Vec<_>>().join(" "))
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(20).collect::<Vec<_>>().join("  "))
         .unwrap_or_default();
 
     let git_branch = std::process::Command::new("git")
@@ -35,13 +35,27 @@ fn build_system_prompt(config: &Config, _recent: &[Entry]) -> String {
         format!("Git branch: {git_branch}\n")
     };
 
+    let history = if recent.is_empty() {
+        String::new()
+    } else {
+        let lines: String = recent.iter().rev()
+            .map(|e| format!("  $ {}  (exit {})", e.command, e.exit_code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Recent commands:\n{lines}\n")
+    };
+
     format!(
-        "Translate the user's request into a single {shell} command for {os}.\n\
-         CWD: {cwd}\n\
+        "You are PSH, an AI assistant embedded in the terminal.\n\
+         OS: {os}  Shell: {shell}  CWD: {cwd}\n\
          Files: {files}\n\
          {git_line}\
-         Output ONLY the command. No explanation. No markdown. No backticks.\n\
-         If dangerous or unclear, output: WARN: <reason>"
+         {history}\n\
+         Reply in exactly one of these formats:\n\
+         CMD: <shell command>        — when the user wants to do something\n\
+         ANSWER: <text>              — when the user asks a question\n\
+         WARN: <reason>              — if the request is dangerous or impossible\n\
+         No markdown. No explanation. One line."
     )
 }
 
@@ -62,9 +76,8 @@ fn build_error_prompt(config: &Config, command: &str, output: &str, exit_code: i
     )
 }
 
-pub fn translate_nl(config: &Config, db: &Db, session: &str, input: &str) -> Option<String> {
-    let recent = db.recent(session, 10);
-    let system = build_system_prompt(config, &recent);
+pub fn translate_nl(config: &Config, recent: &[Entry], input: &str) -> Option<String> {
+    let system = build_system_prompt(config, recent);
     call_ollama(config, &system, input)
 }
 
