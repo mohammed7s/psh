@@ -107,6 +107,8 @@ fn build_machine_context() -> String {
         ("OS",      "uname -srm"),
         ("Distro",  "grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'\"' -f2"),
         ("User",    "whoami"),
+        ("Home",    "echo $HOME"),
+        ("Shell",   "echo $SHELL"),
         ("Host",    "hostname"),
         ("git",     "git --version"),
         ("node",    "node --version 2>/dev/null"),

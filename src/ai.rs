@@ -10,13 +10,15 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
 
     let os = std::env::consts::OS;
 
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+
+    // PSH's own process CWD is wherever it was launched from, not the bash
+    // shell's CWD inside the PTY. HOME is the reliable anchor.
+    let cwd = home.clone();
 
     let files: String = std::process::Command::new("ls")
         .arg("-1")
+        .arg(&home)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(20).collect::<Vec<_>>().join("  "))
         .unwrap_or_default();

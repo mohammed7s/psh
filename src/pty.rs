@@ -176,10 +176,11 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                 io::stdout().flush().ok();
                                 Mode::CollectingNl(prompts[0].as_bytes().to_vec(), 1)
                             } else {
-                                // No NL history — fall back to bash readline
+                                // No NL history — pass to bash readline, stay Idle
+                                // (Passthrough would swallow the next leading space)
                                 pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                                 pty_writer.lock().unwrap().write_all(&rest).ok();
-                                Mode::Passthrough
+                                Mode::Idle
                             }
                         }
                         b"[B" | b"[C" | b"[D" => {
