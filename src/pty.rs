@@ -16,7 +16,8 @@ use std::time::Duration;
 enum Mode {
     Idle,
     Passthrough,
-    CollectingNl(Vec<u8>),
+    // buffer + history_idx (0 = fresh, n = showing nl_prompts()[n-1])
+    CollectingNl(Vec<u8>, usize),
     // Receiver + the NL prompt that triggered it
     Thinking(mpsc::Receiver<Option<String>>, String),
     // cmd + the NL prompt that generated it
@@ -87,7 +88,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
     'main: loop {
 
         // ── THINKING: non-blocking — check ESC then check AI result ──────────
-        if matches!(mode, Mode::Thinking(_, _)) {
+        if matches!(mode, Mode::Thinking(..)) {
             let (rx, nl_prompt) = match std::mem::replace(&mut mode, Mode::Idle) {
                 Mode::Thinking(rx, p) => (rx, p),
                 _ => unreachable!(),
@@ -137,7 +138,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                 b' ' => {
                     print!(" ");
                     io::stdout().flush().ok();
-                    Mode::CollectingNl(Vec::new())
+                    Mode::CollectingNl(Vec::new(), 0)
                 }
                 b'\r' | b'\n' => {
                     pty_writer.lock().unwrap().write_all(&[b'\r']).ok();
@@ -148,11 +149,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     Mode::Idle
                 }
                 0x1b => {
-                    // ESC in Idle: could be user ESC or a terminal escape sequence
-                    // response (e.g. \x1b[24;1R from cursor-position query).
-                    // Consume the entire sequence so follow-on bytes don't land in
-                    // the Idle match and trigger Passthrough.
-                    pty_writer.lock().unwrap().write_all(&[b]).ok();
+                    // Consume the full escape sequence before deciding what to do.
                     let mut rest: Vec<u8> = Vec::new();
                     let deadline = std::time::Instant::now() + Duration::from_millis(5);
                     loop {
@@ -160,26 +157,46 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         match key_rx.try_recv() {
                             Ok(c) => {
                                 rest.push(c);
-                                // CSI sequence (\x1b[...): final byte is 0x40-0x7E
                                 if rest.first() == Some(&b'[') {
                                     if c >= 0x40 && c <= 0x7e { break; }
                                 } else {
-                                    break; // single byte after ESC (e.g. \x1bO, \x1bA)
+                                    break;
                                 }
                             }
-                            Err(mpsc::TryRecvError::Empty) => {
-                                thread::sleep(Duration::from_micros(200));
-                            }
+                            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
                             Err(_) => break,
                         }
                     }
-                    if !rest.is_empty() {
-                        pty_writer.lock().unwrap().write_all(&rest).ok();
+                    match rest.as_slice() {
+                        b"[A" => {
+                            // Up arrow: PSH NL history recall
+                            let prompts = db.nl_prompts();
+                            if !prompts.is_empty() {
+                                print!(" {}", prompts[0]);
+                                io::stdout().flush().ok();
+                                Mode::CollectingNl(prompts[0].as_bytes().to_vec(), 1)
+                            } else {
+                                // No NL history — fall back to bash readline
+                                pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                                pty_writer.lock().unwrap().write_all(&rest).ok();
+                                Mode::Passthrough
+                            }
+                        }
+                        b"[B" | b"[C" | b"[D" => {
+                            // Other arrows: pass to bash readline
+                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                            pty_writer.lock().unwrap().write_all(&rest).ok();
+                            Mode::Passthrough
+                        }
+                        _ => {
+                            // Terminal escape sequence: forward to bash, stay Idle
+                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                            if !rest.is_empty() {
+                                pty_writer.lock().unwrap().write_all(&rest).ok();
+                            }
+                            Mode::Idle
+                        }
                     }
-                    // Arrow keys mean user is navigating history — drop into Passthrough
-                    // so they can edit the recalled command without space triggering NL mode.
-                    let is_arrow = matches!(rest.as_slice(), b"[A" | b"[B" | b"[C" | b"[D");
-                    if is_arrow { Mode::Passthrough } else { Mode::Idle }
                 }
                 _ => {
                     pty_writer.lock().unwrap().write_all(&[b]).ok();
@@ -197,7 +214,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
             }
 
             // ── COLLECTING NL ────────────────────────────────────────────────
-            Mode::CollectingNl(mut nl_buf) => match b {
+            Mode::CollectingNl(mut nl_buf, hist_idx) => match b {
                 b'\r' | b'\n' => {
                     let input = String::from_utf8_lossy(&nl_buf).trim().to_string();
                     if input.is_empty() {
@@ -208,12 +225,10 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         print!("\r\n");
                         io::stdout().flush().ok();
 
-                        // Start spinner
                         spinner_stop.store(false, Ordering::Relaxed);
                         let stop = spinner_stop.clone();
                         thread::spawn(move || spin(stop));
 
-                        // Ollama on background thread — main loop stays responsive
                         let recent = db.recent(10);
                         let cfg = config.clone();
                         let nl = input.clone();
@@ -231,7 +246,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         print!("\x08 \x08");
                         io::stdout().flush().ok();
                     }
-                    Mode::CollectingNl(nl_buf)
+                    Mode::CollectingNl(nl_buf, hist_idx)
                 }
                 3 => {
                     print!("\r\n");
@@ -240,12 +255,9 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     Mode::Idle
                 }
                 0x1b => {
-                    // Peek: terminal CSI sequences (\x1b[...) arrive as a burst.
-                    // User ESC is an isolated byte. Wait briefly to tell them apart.
                     thread::sleep(Duration::from_micros(500));
                     match key_rx.try_recv() {
                         Ok(b'[') => {
-                            // Terminal escape sequence — consume it, stay collecting.
                             let mut seq = vec![b'['];
                             let deadline = std::time::Instant::now() + Duration::from_millis(5);
                             loop {
@@ -256,19 +268,56 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                     Err(_) => break,
                                 }
                             }
-                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
-                            pty_writer.lock().unwrap().write_all(&seq).ok();
-                            Mode::CollectingNl(nl_buf)
+                            match seq.as_slice() {
+                                b"[A" => {
+                                    // Up: older NL prompt
+                                    let prompts = db.nl_prompts();
+                                    let new_idx = hist_idx + 1;
+                                    if new_idx <= prompts.len() {
+                                        let p = prompts[new_idx - 1].clone();
+                                        for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
+                                        print!("{}", p);
+                                        io::stdout().flush().ok();
+                                        Mode::CollectingNl(p.into_bytes(), new_idx)
+                                    } else {
+                                        Mode::CollectingNl(nl_buf, hist_idx)
+                                    }
+                                }
+                                b"[B" => {
+                                    // Down: newer NL prompt
+                                    if hist_idx == 0 {
+                                        Mode::CollectingNl(nl_buf, 0)
+                                    } else {
+                                        let new_idx = hist_idx - 1;
+                                        for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
+                                        if new_idx == 0 {
+                                            io::stdout().flush().ok();
+                                            Mode::CollectingNl(vec![], 0)
+                                        } else {
+                                            let prompts = db.nl_prompts();
+                                            let p = prompts[new_idx - 1].clone();
+                                            print!("{}", p);
+                                            io::stdout().flush().ok();
+                                            Mode::CollectingNl(p.into_bytes(), new_idx)
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Terminal CSI — forward to bash, stay collecting
+                                    pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                                    pty_writer.lock().unwrap().write_all(&seq).ok();
+                                    Mode::CollectingNl(nl_buf, hist_idx)
+                                }
+                            }
                         }
                         Ok(other) => {
-                            // ESC + something else — cancel, forward both to bash.
                             print!("\r\n");
                             io::stdout().flush().ok();
                             pty_writer.lock().unwrap().write_all(&[0x1b, other]).ok();
                             Mode::Idle
                         }
                         Err(_) => {
-                            // Nothing followed — real user ESC, cancel.
+                            // User ESC — cancel
                             print!("\r\n");
                             io::stdout().flush().ok();
                             pty_writer.lock().unwrap().write_all(b"\r").ok();
@@ -280,7 +329,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     nl_buf.push(b);
                     io::stdout().write_all(&[b]).ok();
                     io::stdout().flush().ok();
-                    Mode::CollectingNl(nl_buf)
+                    Mode::CollectingNl(nl_buf, 0) // any regular key detaches from history
                 }
             },
 

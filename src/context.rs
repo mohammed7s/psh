@@ -39,6 +39,18 @@ impl History {
         fs::write(&self.path, trimmed).ok();
     }
 
+    /// NL prompts only, newest first (for up-arrow recall).
+    pub fn nl_prompts(&self) -> Vec<String> {
+        let raw = fs::read_to_string(&self.path).unwrap_or_default();
+        raw.lines()
+            .filter_map(decode)
+            .filter_map(|e| e.nl_prompt)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
     /// Last `limit` entries, oldest first.
     pub fn recent(&self, limit: usize) -> Vec<HistoryEntry> {
         let raw = fs::read_to_string(&self.path).unwrap_or_default();
