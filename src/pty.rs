@@ -15,7 +15,9 @@ use std::time::Duration;
 
 enum Mode {
     Idle,
-    Passthrough,
+    // Shadow buffer: mirrors what was typed and forwarded to bash.
+    // Ctrl+J submits it as an NL query; regular Enter runs it as a command.
+    Passthrough(Vec<u8>),
     // buffer + history_idx (0 = fresh, n = showing nl_prompts()[n-1])
     CollectingNl(Vec<u8>, usize),
     // Receiver + the NL prompt that triggered it
@@ -36,7 +38,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
         pixel_width: 0, pixel_height: 0,
     }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    let mut cmd = CommandBuilder::new(&config.underlying_shell);
+    let cmd = CommandBuilder::new(&config.underlying_shell);
 
     let _child = pair.slave.spawn_command(cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -65,8 +67,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
 
     enable_raw_mode()?;
 
-    // Stdin reader thread — frees the main loop from blocking reads
-    // so ESC/Ctrl+C can always be received even during Ollama calls
+    // Stdin reader thread
     let (key_tx, key_rx) = mpsc::channel::<u8>();
     thread::spawn(move || {
         let stdin = io::stdin();
@@ -78,8 +79,8 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
         }
     });
 
-    // Drain terminal init sequences (e.g. \x1b[?...) sent right after raw mode starts
-    thread::sleep(Duration::from_millis(30));
+    // Drain terminal init sequences — GNOME Terminal sends more when it's the default shell
+    thread::sleep(Duration::from_millis(200));
     while key_rx.try_recv().is_ok() {}
 
     let spinner_stop = Arc::new(AtomicBool::new(true));
@@ -135,11 +136,6 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
 
             // ── IDLE ─────────────────────────────────────────────────────────
             Mode::Idle => match b {
-                b' ' => {
-                    print!(" ");
-                    io::stdout().flush().ok();
-                    Mode::CollectingNl(Vec::new(), 0)
-                }
                 b'\r' | b'\n' => {
                     pty_writer.lock().unwrap().write_all(&[b'\r']).ok();
                     Mode::Idle
@@ -149,9 +145,8 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     Mode::Idle
                 }
                 0x1b => {
-                    // Consume the full escape sequence before deciding what to do.
                     let mut rest: Vec<u8> = Vec::new();
-                    let deadline = std::time::Instant::now() + Duration::from_millis(5);
+                    let deadline = std::time::Instant::now() + Duration::from_millis(20);
                     loop {
                         if std::time::Instant::now() >= deadline { break; }
                         match key_rx.try_recv() {
@@ -168,29 +163,17 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         }
                     }
                     match rest.as_slice() {
-                        b"[A" => {
-                            // Up arrow: PSH NL history recall
-                            let prompts = db.nl_prompts();
-                            if !prompts.is_empty() {
-                                print!(" {}", prompts[0]);
-                                io::stdout().flush().ok();
-                                Mode::CollectingNl(prompts[0].as_bytes().to_vec(), 1)
-                            } else {
-                                // No NL history — pass to bash readline, stay Idle
-                                // (Passthrough would swallow the next leading space)
-                                pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
-                                pty_writer.lock().unwrap().write_all(&rest).ok();
-                                Mode::Idle
-                            }
+                        b"\r" => {
+                            // Alt+Enter on empty line: enter NL collecting mode
+                            Mode::CollectingNl(Vec::new(), 0)
                         }
-                        b"[B" | b"[C" | b"[D" => {
-                            // Other arrows: pass to bash readline
+                        b"[A" | b"[B" | b"[C" | b"[D" => {
+                            // Arrow keys: pass to bash readline, shadow starts empty
                             pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                             pty_writer.lock().unwrap().write_all(&rest).ok();
-                            Mode::Passthrough
+                            Mode::Passthrough(Vec::new())
                         }
                         _ => {
-                            // Terminal escape sequence: forward to bash, stay Idle
                             pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                             if !rest.is_empty() {
                                 pty_writer.lock().unwrap().write_all(&rest).ok();
@@ -201,18 +184,118 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                 }
                 _ => {
                     pty_writer.lock().unwrap().write_all(&[b]).ok();
-                    Mode::Passthrough
+                    Mode::Passthrough(vec![b])
                 }
             },
 
             // ── PASSTHROUGH ──────────────────────────────────────────────────
-            Mode::Passthrough => {
-                pty_writer.lock().unwrap().write_all(&[b]).ok();
-                match b {
-                    b'\r' | b'\n' | 3 => Mode::Idle,
-                    _ => Mode::Passthrough,
+            // Shadow buffer mirrors what was typed so Ctrl+J can submit it to AI.
+            Mode::Passthrough(mut shadow) => match b {
+                b'\n' => {
+                    // Ctrl+J: submit shadow as NL query
+                    let input = String::from_utf8_lossy(&shadow).trim().to_string();
+                    if !input.is_empty() {
+                        // Move to next line first so typed text stays visible above
+                        print!("\r\n");
+                        io::stdout().flush().ok();
+                        // Clear bash's input buffer (Ctrl+U) — on the new empty line,
+                        // its echo has no visible effect on the text above
+                        thread::sleep(Duration::from_millis(10));
+                        pty_writer.lock().unwrap().write_all(&[b'\x15']).ok();
+
+                        spinner_stop.store(false, Ordering::Relaxed);
+                        let stop = spinner_stop.clone();
+                        thread::spawn(move || spin(stop));
+
+                        let recent = db.recent(10);
+                        let cfg = config.clone();
+                        let nl = input.clone();
+                        let (tx, rx) = mpsc::channel();
+                        thread::spawn(move || {
+                            let result = ai::translate_nl(&cfg, &recent, &nl);
+                            tx.send(result).ok();
+                        });
+                        Mode::Thinking(rx, input)
+                    } else {
+                        pty_writer.lock().unwrap().write_all(&[b'\r']).ok();
+                        Mode::Idle
+                    }
                 }
-            }
+                0x7f | 0x08 => {
+                    shadow.pop();
+                    pty_writer.lock().unwrap().write_all(&[b]).ok();
+                    Mode::Passthrough(shadow)
+                }
+                0x15 => {
+                    // Ctrl+U: clear shadow too
+                    shadow.clear();
+                    pty_writer.lock().unwrap().write_all(&[b]).ok();
+                    Mode::Passthrough(shadow)
+                }
+                b'\r' | 3 => {
+                    pty_writer.lock().unwrap().write_all(&[b]).ok();
+                    Mode::Idle
+                }
+                0x1b => {
+                    // Consume full ESC sequence
+                    let mut rest: Vec<u8> = Vec::new();
+                    let deadline = std::time::Instant::now() + Duration::from_millis(20);
+                    loop {
+                        if std::time::Instant::now() >= deadline { break; }
+                        match key_rx.try_recv() {
+                            Ok(c) => {
+                                rest.push(c);
+                                if rest.first() == Some(&b'[') {
+                                    if c >= 0x40 && c <= 0x7e { break; }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
+                            Err(_) => break,
+                        }
+                    }
+                    if rest.as_slice() == b"\r" {
+                        // Alt+Enter: same as Ctrl+J — submit shadow as NL query
+                        let input = String::from_utf8_lossy(&shadow).trim().to_string();
+                        if !input.is_empty() {
+                            print!("\r\n");
+                            io::stdout().flush().ok();
+                            thread::sleep(Duration::from_millis(10));
+                            pty_writer.lock().unwrap().write_all(&[b'\x15']).ok();
+
+                            spinner_stop.store(false, Ordering::Relaxed);
+                            let stop = spinner_stop.clone();
+                            thread::spawn(move || spin(stop));
+
+                            let recent = db.recent(10);
+                            let cfg = config.clone();
+                            let nl = input.clone();
+                            let (tx, rx) = mpsc::channel();
+                            thread::spawn(move || {
+                                let result = ai::translate_nl(&cfg, &recent, &nl);
+                                tx.send(result).ok();
+                            });
+                            Mode::Thinking(rx, input)
+                        } else {
+                            // Nothing typed yet: enter fresh NL collecting mode
+                            Mode::CollectingNl(Vec::new(), 0)
+                        }
+                    } else {
+                        // Other ESC sequence (arrows, terminal queries): forward, shadow unchanged
+                        pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                        if !rest.is_empty() {
+                            pty_writer.lock().unwrap().write_all(&rest).ok();
+                        }
+                        Mode::Passthrough(shadow)
+                    }
+                }
+                _ => {
+                    shadow.push(b);
+                    pty_writer.lock().unwrap().write_all(&[b]).ok();
+                    Mode::Passthrough(shadow)
+                }
+            },
 
             // ── COLLECTING NL ────────────────────────────────────────────────
             Mode::CollectingNl(mut nl_buf, hist_idx) => match b {
@@ -260,7 +343,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     match key_rx.try_recv() {
                         Ok(b'[') => {
                             let mut seq = vec![b'['];
-                            let deadline = std::time::Instant::now() + Duration::from_millis(5);
+                            let deadline = std::time::Instant::now() + Duration::from_millis(20);
                             loop {
                                 if std::time::Instant::now() >= deadline { break; }
                                 match key_rx.try_recv() {
@@ -271,7 +354,6 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                             }
                             match seq.as_slice() {
                                 b"[A" => {
-                                    // Up: older NL prompt
                                     let prompts = db.nl_prompts();
                                     let new_idx = hist_idx + 1;
                                     if new_idx <= prompts.len() {
@@ -285,7 +367,6 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                     }
                                 }
                                 b"[B" => {
-                                    // Down: newer NL prompt
                                     if hist_idx == 0 {
                                         Mode::CollectingNl(nl_buf, 0)
                                     } else {
@@ -304,11 +385,33 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                     }
                                 }
                                 _ => {
-                                    // Terminal CSI — forward to bash, stay collecting
                                     pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                                     pty_writer.lock().unwrap().write_all(&seq).ok();
                                     Mode::CollectingNl(nl_buf, hist_idx)
                                 }
+                            }
+                        }
+                        Ok(b'\r') => {
+                            // Alt+Enter while collecting: submit
+                            let input = String::from_utf8_lossy(&nl_buf).trim().to_string();
+                            print!("\r\n");
+                            io::stdout().flush().ok();
+                            if input.is_empty() {
+                                pty_writer.lock().unwrap().write_all(b"\r").ok();
+                                Mode::Idle
+                            } else {
+                                spinner_stop.store(false, Ordering::Relaxed);
+                                let stop = spinner_stop.clone();
+                                thread::spawn(move || spin(stop));
+                                let recent = db.recent(10);
+                                let cfg = config.clone();
+                                let nl = input.clone();
+                                let (tx, rx) = mpsc::channel();
+                                thread::spawn(move || {
+                                    let result = ai::translate_nl(&cfg, &recent, &nl);
+                                    tx.send(result).ok();
+                                });
+                                Mode::Thinking(rx, input)
                             }
                         }
                         Ok(other) => {
@@ -318,7 +421,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                             Mode::Idle
                         }
                         Err(_) => {
-                            // User ESC — cancel
+                            // ESC alone: cancel
                             print!("\r\n");
                             io::stdout().flush().ok();
                             pty_writer.lock().unwrap().write_all(b"\r").ok();
@@ -330,7 +433,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     nl_buf.push(b);
                     io::stdout().write_all(&[b]).ok();
                     io::stdout().flush().ok();
-                    Mode::CollectingNl(nl_buf, 0) // any regular key detaches from history
+                    Mode::CollectingNl(nl_buf, 0)
                 }
             },
 
@@ -376,7 +479,7 @@ fn spin(stop: Arc<AtomicBool>) {
 
 fn stop_spinner(stop: &Arc<AtomicBool>) {
     stop.store(true, Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(90)); // wait for spinner thread to clear the line
+    thread::sleep(Duration::from_millis(90));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -392,11 +495,13 @@ fn show_result(
         Some(resp) if resp.starts_with("ANSWER:") => {
             print!("\r\x1b[2K\x1b[2m  {}\x1b[0m\r\n", resp[7..].trim());
             io::stdout().flush().ok();
+            pty_writer.lock().unwrap().write_all(b"\r").ok();
             Mode::Idle
         }
         Some(resp) if resp.starts_with("WARN:") => {
             print!("\r\x1b[2K\x1b[33m  ⚠  {}\x1b[0m\r\n", resp[5..].trim());
             io::stdout().flush().ok();
+            pty_writer.lock().unwrap().write_all(b"\r").ok();
             Mode::Idle
         }
         Some(resp) => {

@@ -24,15 +24,20 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        let path = home_dir()
-            .unwrap_or_default()
-            .join(".psh")
-            .join("config.toml");
+        let dir = home_dir().unwrap_or_default().join(".psh");
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("config.toml");
 
         if let Ok(contents) = fs::read_to_string(&path) {
             toml::from_str(&contents).unwrap_or_default()
         } else {
-            Self::default()
+            let cfg = Self::default();
+            let toml = format!(
+                "underlying_shell = \"{}\"\nollama_url = \"{}\"\nmodel = \"{}\"\nconfirm_commands = {}\n",
+                cfg.underlying_shell, cfg.ollama_url, cfg.model, cfg.confirm_commands
+            );
+            fs::write(&path, toml).ok();
+            cfg
         }
     }
 }

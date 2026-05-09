@@ -12,8 +12,6 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
 
-    // PSH's own process CWD is wherever it was launched from, not the bash
-    // shell's CWD inside the PTY. HOME is the reliable anchor.
     let cwd = home.clone();
 
     let files: String = std::process::Command::new("ls")
@@ -58,47 +56,90 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
     };
 
     format!(
-        "You are PSH, a terminal AI that translates natural language into shell commands.\n\
+        "You are PSH, a terminal AI assistant. You help users by running commands and reasoning about their output.\n\
          OS: {os}  Shell: {shell}  CWD: {cwd}\n\
-         Files: {files}\n\
+         Home dir files: {files}\n\
          {git_line}\
          {machine_section}\
          {history}\n\
-         Respond with EXACTLY one of:\n\
-         CMD: <shell command>   — a real, executable shell command\n\
-         ANSWER: <text>         — for questions that need no command\n\
-         WARN: <reason>         — only if the request is dangerous or impossible\n\
+         You have four response types:\n\
+         EXEC: <command>   — run a read-only command to gather information, then reason about its output\n\
+         CMD: <command>    — a command for the user to run (shown on screen, user confirms)\n\
+         ANSWER: <text>    — a direct answer to the user's question\n\
+         WARN: <reason>    — if the request is dangerous or impossible\n\
          \n\
-         Rules for CMD:\n\
-         - Must be valid shell syntax — NEVER put natural language in CMD\n\
-         - Use && to chain multiple steps: CMD: mkdir foo && cd foo && git init\n\
+         Rules:\n\
+         - Use EXEC to look up information before answering (check versions, list files, read configs, etc.)\n\
+         - EXEC must be READ-ONLY — no writes, deletes, or installs\n\
+         - After EXEC output arrives, reason about it and respond with the next EXEC, CMD, or ANSWER\n\
+         - CMD must be valid shell syntax — never put natural language in CMD\n\
+         - Use && in CMD to chain steps: CMD: mkdir foo && cd foo && git init\n\
+         - ANSWER for questions; CMD for actions\n\
          \n\
          Examples:\n\
-         list files → CMD: ls -la\n\
-         find python files → CMD: find . -name '*.py'\n\
-         find file called foo in home → CMD: find ~ -maxdepth 1 -name 'foo'\n\
-         what branch → CMD: git branch --show-current\n\
-         capital of france → ANSWER: Paris\n\
-         delete everything → WARN: This permanently deletes files\n\
+         'how to update rust' → EXEC: rustc --version && rustup show\n\
+         'list python files'  → CMD: find . -name '*.py'\n\
+         'capital of france'  → ANSWER: Paris\n\
+         'install node'       → CMD: curl -fsSL https://fnm.vercel.app/install | bash\n\
          \n\
-         One line. No markdown. No explanation."
+         One line per response. No markdown. No explanation outside the format."
     )
 }
 
+/// Translate natural language to a shell action, with an agentic EXEC loop
+/// so the AI can gather information before answering.
 pub fn translate_nl(config: &Config, recent: &[HistoryEntry], input: &str) -> Option<String> {
     let system = build_system_prompt(config, recent);
-    call_ollama(config, &system, input)
+
+    let mut messages: Vec<Value> = vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user",   "content": input}),
+    ];
+
+    for _ in 0..6 {
+        let resp = call_ollama_msgs(config, &messages)?;
+
+        if let Some(cmd) = resp.strip_prefix("EXEC:") {
+            let cmd = cmd.trim();
+            let output = capture(cmd);
+            messages.push(json!({"role": "assistant", "content": resp}));
+            messages.push(json!({"role": "user", "content": format!("Command output:\n{}", output)}));
+        } else {
+            return Some(resp);
+        }
+    }
+
+    None
 }
 
-fn call_ollama(config: &Config, system: &str, user_msg: &str) -> Option<String> {
+/// Run a command and capture its combined stdout+stderr (for EXEC loop).
+fn capture(cmd: &str) -> String {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+    {
+        Ok(o) => {
+            let mut out = String::new();
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stdout.trim().is_empty() { out.push_str(stdout.trim()); }
+            if !stderr.trim().is_empty() {
+                if !out.is_empty() { out.push('\n'); }
+                out.push_str(stderr.trim());
+            }
+            if out.is_empty() { "(no output)".to_string() } else { out }
+        }
+        Err(e) => format!("error: {}", e),
+    }
+}
+
+fn call_ollama_msgs(config: &Config, messages: &[Value]) -> Option<String> {
     let url = format!("{}/api/chat", config.ollama_url);
     let body = json!({
         "model": config.model,
         "stream": false,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user",   "content": user_msg }
-        ]
+        "messages": messages
     });
 
     let client = reqwest::blocking::Client::builder()
