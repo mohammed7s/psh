@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::context::Entry;
+use crate::context::{HistoryEntry, load_machine_context};
 use serde_json::{json, Value};
 
-fn build_system_prompt(config: &Config, recent: &[Entry]) -> String {
+fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
     let shell = std::path::Path::new(&config.underlying_shell)
         .file_name()
         .unwrap_or_default()
@@ -35,55 +35,57 @@ fn build_system_prompt(config: &Config, recent: &[Entry]) -> String {
         format!("Git branch: {git_branch}\n")
     };
 
+    let machine_ctx = load_machine_context();
+    let machine_section = if machine_ctx.is_empty() {
+        String::new()
+    } else {
+        format!("Machine:\n{}\n", machine_ctx)
+    };
+
     let history = if recent.is_empty() {
         String::new()
     } else {
-        let lines: String = recent.iter().rev()
-            .map(|e| format!("  $ {}  (exit {})", e.command, e.exit_code))
+        let lines: String = recent.iter()
+            .map(|e| match &e.nl_prompt {
+                Some(p) => format!("  \"{}\" → {}", p, e.command),
+                None    => format!("  $ {}", e.command),
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        format!("Recent commands:\n{lines}\n")
+        format!("Recent history:\n{lines}\n")
     };
 
     format!(
-        "You are PSH, an AI assistant embedded in the terminal.\n\
+        "You are PSH, a terminal AI that translates natural language into shell commands.\n\
          OS: {os}  Shell: {shell}  CWD: {cwd}\n\
          Files: {files}\n\
          {git_line}\
+         {machine_section}\
          {history}\n\
-         Reply in exactly one of these formats:\n\
-         CMD: <shell command>        — when the user wants to do something\n\
-         ANSWER: <text>              — when the user asks a question\n\
-         WARN: <reason>              — if the request is dangerous or impossible\n\
-         No markdown. No explanation. One line."
+         Respond with EXACTLY one of:\n\
+         CMD: <shell command>   — a real, executable shell command\n\
+         ANSWER: <text>         — for questions that need no command\n\
+         WARN: <reason>         — only if the request is dangerous or impossible\n\
+         \n\
+         Rules for CMD:\n\
+         - Must be valid shell syntax — NEVER put natural language in CMD\n\
+         - Use && to chain multiple steps: CMD: mkdir foo && cd foo && git init\n\
+         \n\
+         Examples:\n\
+         list files → CMD: ls -la\n\
+         find python files → CMD: find . -name '*.py'\n\
+         find file called foo in home → CMD: find ~ -maxdepth 1 -name 'foo'\n\
+         what branch → CMD: git branch --show-current\n\
+         capital of france → ANSWER: Paris\n\
+         delete everything → WARN: This permanently deletes files\n\
+         \n\
+         One line. No markdown. No explanation."
     )
 }
 
-fn build_error_prompt(config: &Config, command: &str, output: &str, exit_code: i32) -> String {
-    let shell = std::path::Path::new(&config.underlying_shell)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-
-    format!(
-        "You are PSH. A shell command failed.\n\
-         Shell: {shell}\n\
-         Command: {command}\n\
-         Exit code: {exit_code}\n\
-         Output:\n{output}\n\n\
-         Explain what went wrong in 1-2 sentences and give the exact fix command.\n\
-         Format: REASON: <reason> | FIX: <command>"
-    )
-}
-
-pub fn translate_nl(config: &Config, recent: &[Entry], input: &str) -> Option<String> {
+pub fn translate_nl(config: &Config, recent: &[HistoryEntry], input: &str) -> Option<String> {
     let system = build_system_prompt(config, recent);
     call_ollama(config, &system, input)
-}
-
-pub fn explain_error(config: &Config, command: &str, output: &str, exit_code: i32) -> Option<String> {
-    let system = build_error_prompt(config, command, output, exit_code);
-    call_ollama(config, &system, "Explain this error and give the fix.")
 }
 
 fn call_ollama(config: &Config, system: &str, user_msg: &str) -> Option<String> {

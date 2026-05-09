@@ -7,6 +7,7 @@ use std::io;
 
 fn main() -> io::Result<()> {
     let config = config::Config::load();
-    let db = context::Db::open();
+    context::refresh_machine_context();
+    let db = context::History::open();
     pty::run(&config, &db)
 }

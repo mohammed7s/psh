@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::context::{Db, Entry};
+use crate::context::{History, HistoryEntry};
 use crate::ai;
 
 use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
@@ -17,15 +17,15 @@ enum Mode {
     Idle,
     Passthrough,
     CollectingNl(Vec<u8>),
-    // Ollama running on background thread — main loop stays free to read ESC
-    Thinking(mpsc::Receiver<Option<String>>),
-    Confirming(String),
+    // Receiver + the NL prompt that triggered it
+    Thinking(mpsc::Receiver<Option<String>>, String),
+    // cmd + the NL prompt that generated it
+    Confirming(String, String),
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-pub fn run(config: &Config, db: &Db) -> io::Result<()> {
-    let session = uuid();
+pub fn run(config: &Config, db: &History) -> io::Result<()> {
 
     let pty_system = native_pty_system();
     let size = crossterm::terminal::size().unwrap_or((80, 24));
@@ -36,7 +36,6 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
     }).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     let mut cmd = CommandBuilder::new(&config.underlying_shell);
-    cmd.env("PSH_SESSION", &session);
 
     let _child = pair.slave.spawn_command(cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -88,24 +87,18 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
     'main: loop {
 
         // ── THINKING: non-blocking — check ESC then check AI result ──────────
-        if matches!(mode, Mode::Thinking(_)) {
-            // Pull rx out so we can reassign mode freely
-            let rx = match std::mem::replace(&mut mode, Mode::Idle) {
-                Mode::Thinking(rx) => rx,
+        if matches!(mode, Mode::Thinking(_, _)) {
+            let (rx, nl_prompt) = match std::mem::replace(&mut mode, Mode::Idle) {
+                Mode::Thinking(rx, p) => (rx, p),
                 _ => unreachable!(),
             };
 
-            // Drain ALL pending keys — only ESC/Ctrl+C cancels, rest are discarded.
-            // Keys typed during thinking must not leak into the next state.
             let mut cancelled = false;
             while let Ok(b) = key_rx.try_recv() {
-                if b == 0x1b || b == 3 {
-                    cancelled = true;
-                    break;
-                }
+                if b == 0x1b || b == 3 { cancelled = true; break; }
             }
             if cancelled {
-                while key_rx.try_recv().is_ok() {} // flush remainder
+                while key_rx.try_recv().is_ok() {}
                 stop_spinner(&spinner_stop);
                 pty_writer.lock().unwrap().write_all(b"\r").ok();
                 continue 'main;
@@ -113,18 +106,17 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
 
             match rx.try_recv() {
                 Ok(result) => {
-                    while key_rx.try_recv().is_ok() {} // flush stale input before next state
+                    while key_rx.try_recv().is_ok() {}
                     stop_spinner(&spinner_stop);
-                    mode = show_result(result, config, &pty_writer, &session, db);
+                    mode = show_result(result, &nl_prompt, config, &pty_writer, db);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    mode = Mode::Thinking(rx); // still waiting
+                    mode = Mode::Thinking(rx, nl_prompt);
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     while key_rx.try_recv().is_ok() {}
                     stop_spinner(&spinner_stop);
-                    // mode stays Idle
                 }
             }
             continue 'main;
@@ -184,7 +176,10 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                     if !rest.is_empty() {
                         pty_writer.lock().unwrap().write_all(&rest).ok();
                     }
-                    Mode::Idle
+                    // Arrow keys mean user is navigating history — drop into Passthrough
+                    // so they can edit the recalled command without space triggering NL mode.
+                    let is_arrow = matches!(rest.as_slice(), b"[A" | b"[B" | b"[C" | b"[D");
+                    if is_arrow { Mode::Passthrough } else { Mode::Idle }
                 }
                 _ => {
                     pty_writer.lock().unwrap().write_all(&[b]).ok();
@@ -219,15 +214,16 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                         thread::spawn(move || spin(stop));
 
                         // Ollama on background thread — main loop stays responsive
-                        let recent = db.recent(&session, 10);
+                        let recent = db.recent(10);
                         let cfg = config.clone();
+                        let nl = input.clone();
                         let (tx, rx) = mpsc::channel();
                         thread::spawn(move || {
-                            let result = ai::translate_nl(&cfg, &recent, &input);
+                            let result = ai::translate_nl(&cfg, &recent, &nl);
                             tx.send(result).ok();
                         });
 
-                        Mode::Thinking(rx)
+                        Mode::Thinking(rx, input)
                     }
                 }
                 0x7f | 0x08 => {
@@ -237,11 +233,48 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                     }
                     Mode::CollectingNl(nl_buf)
                 }
-                0x1b | 3 => {
+                3 => {
                     print!("\r\n");
                     io::stdout().flush().ok();
                     pty_writer.lock().unwrap().write_all(b"\r").ok();
                     Mode::Idle
+                }
+                0x1b => {
+                    // Peek: terminal CSI sequences (\x1b[...) arrive as a burst.
+                    // User ESC is an isolated byte. Wait briefly to tell them apart.
+                    thread::sleep(Duration::from_micros(500));
+                    match key_rx.try_recv() {
+                        Ok(b'[') => {
+                            // Terminal escape sequence — consume it, stay collecting.
+                            let mut seq = vec![b'['];
+                            let deadline = std::time::Instant::now() + Duration::from_millis(5);
+                            loop {
+                                if std::time::Instant::now() >= deadline { break; }
+                                match key_rx.try_recv() {
+                                    Ok(c) => { seq.push(c); if c >= 0x40 && c <= 0x7e { break; } }
+                                    Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
+                                    Err(_) => break,
+                                }
+                            }
+                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                            pty_writer.lock().unwrap().write_all(&seq).ok();
+                            Mode::CollectingNl(nl_buf)
+                        }
+                        Ok(other) => {
+                            // ESC + something else — cancel, forward both to bash.
+                            print!("\r\n");
+                            io::stdout().flush().ok();
+                            pty_writer.lock().unwrap().write_all(&[0x1b, other]).ok();
+                            Mode::Idle
+                        }
+                        Err(_) => {
+                            // Nothing followed — real user ESC, cancel.
+                            print!("\r\n");
+                            io::stdout().flush().ok();
+                            pty_writer.lock().unwrap().write_all(b"\r").ok();
+                            Mode::Idle
+                        }
+                    }
                 }
                 _ => {
                     nl_buf.push(b);
@@ -252,11 +285,11 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
             },
 
             // ── CONFIRMING ───────────────────────────────────────────────────
-            Mode::Confirming(cmd) => match b {
+            Mode::Confirming(cmd, nl_prompt) => match b {
                 b'y' | b'Y' | b'\r' | b'\n' => {
                     print!("y\r\n");
                     io::stdout().flush().ok();
-                    run_command(&pty_writer, &cmd, &session, db);
+                    run_command(&pty_writer, &cmd, &nl_prompt, db);
                     Mode::Idle
                 }
                 b'n' | b'N' | 3 | 0x1b => {
@@ -265,10 +298,10 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                     pty_writer.lock().unwrap().write_all(b"\r").ok();
                     Mode::Idle
                 }
-                _ => Mode::Confirming(cmd),
+                _ => Mode::Confirming(cmd, nl_prompt),
             },
 
-            Mode::Thinking(_) => unreachable!(),
+            Mode::Thinking(_, _) => unreachable!(),
         };
     }
 
@@ -300,10 +333,10 @@ fn stop_spinner(stop: &Arc<AtomicBool>) {
 
 fn show_result(
     result: Option<String>,
+    nl_prompt: &str,
     config: &Config,
     pty_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-    session: &str,
-    db: &Db,
+    db: &History,
 ) -> Mode {
     match result {
         Some(resp) if resp.starts_with("ANSWER:") => {
@@ -318,13 +351,30 @@ fn show_result(
         }
         Some(resp) => {
             let cmd = resp.strip_prefix("CMD:").unwrap_or(&resp).trim().to_string();
-            print!("\r\x1b[2K\x1b[36m  ❯\x1b[0m  {}  \x1b[2m[y/n]\x1b[0m ", cmd);
-            io::stdout().flush().ok();
-            if config.confirm_commands {
-                Mode::Confirming(cmd)
+            let auto_run = is_safe_command(&cmd) || !config.confirm_commands;
+
+            print!("\r\x1b[2K");
+            if cmd.contains(" && ") {
+                for (i, step) in cmd.split(" && ").enumerate() {
+                    if i == 0 {
+                        print!("\x1b[36m  ❯\x1b[0m  {}", step.trim());
+                    } else {
+                        print!("\r\n     \x1b[2m&&\x1b[0m  {}", step.trim());
+                    }
+                }
             } else {
-                run_command(pty_writer, &cmd, session, db);
+                print!("\x1b[36m  ❯\x1b[0m  {}", cmd);
+            }
+
+            if auto_run {
+                print!("\r\n");
+                io::stdout().flush().ok();
+                run_command(pty_writer, &cmd, nl_prompt, db);
                 Mode::Idle
+            } else {
+                print!("  \x1b[2m[y/n]\x1b[0m ");
+                io::stdout().flush().ok();
+                Mode::Confirming(cmd, nl_prompt.to_string())
             }
         }
         None => {
@@ -335,24 +385,37 @@ fn show_result(
     }
 }
 
+fn is_safe_command(cmd: &str) -> bool {
+    cmd.split("&&").all(|part| {
+        let first = part.trim().split_whitespace().next().unwrap_or("");
+        match first {
+            "ls" | "find" | "grep" | "egrep" | "fgrep" | "rg" | "ag" | "fd" |
+            "cat" | "head" | "tail" | "less" | "more" | "wc" | "sort" | "uniq" |
+            "cut" | "awk" | "sed" | "echo" | "printf" | "pwd" | "which" | "type" |
+            "file" | "stat" | "du" | "df" | "ps" | "free" | "uname" | "hostname" |
+            "whoami" | "id" | "groups" | "diff" | "locate" | "tree" => true,
+            "git" => matches!(
+                part.trim().split_whitespace().nth(1).unwrap_or(""),
+                "status" | "log" | "diff" | "branch" | "show" |
+                "remote" | "ls-files" | "describe" | "tag" | "stash"
+            ),
+            _ => false,
+        }
+    })
+}
+
 fn run_command(
     pty_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
     cmd: &str,
-    session: &str,
-    db: &Db,
+    nl_prompt: &str,
+    db: &History,
 ) {
     pty_writer.lock().unwrap().write_all(format!("{}\r\n", cmd).as_bytes()).ok();
     thread::sleep(Duration::from_millis(300));
-    db.insert(session, &Entry {
-        cwd:      std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
-        command:  cmd.to_string(),
-        output:   String::new(),
+    db.append(&HistoryEntry {
+        cwd:       std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+        nl_prompt: if nl_prompt.is_empty() { None } else { Some(nl_prompt.to_string()) },
+        command:   cmd.to_string(),
         exit_code: 0,
     });
-}
-
-fn uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{}-{}", t.as_secs(), t.subsec_nanos())
 }

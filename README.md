@@ -5,16 +5,18 @@ A shell wrapper that sits between your terminal and bash. Type commands normally
 ```
 ubuntu@machine:~$  find all python files modified today
   ⠹  thinking
-  ❯  find . -name "*.py" -mtime -1  [y/n] y
+  ❯  find . -name "*.py" -mtime -1
 ./src/main.py
 ./tests/test_core.py
+
+ubuntu@machine:~$  compress the logs folder into a tar.gz
+  ❯  tar -czf logs.tar.gz logs  [y/n] y
 ```
 
 ## Requirements
 
 - Rust (https://rustup.rs)
-- Ollama (https://ollama.com/install)
-- A local model — default is `gemma3:4b`
+- Ollama (https://ollama.com/install) with a local model
 
 ## Install
 
@@ -22,31 +24,28 @@ ubuntu@machine:~$  find all python files modified today
 # 1. Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
 
-# 2. Pull the model
+# 2. Pull a model (gemma3:4b is small and fast; llama3.1:8b is more accurate)
 ollama pull gemma3:4b
 
-# 3. Build PSH
+# 3. Build and install
 cargo build --release
-
-# 4. Install the binary
 sudo cp target/release/psh /usr/local/bin/psh
 ```
 
 ## Run
 
-**Option A — Just try it (no system changes):**
+**Try it without installing:**
 ```bash
 cargo build
 ./target/debug/psh
 ```
 
-**Option B — Set as default in GNOME Terminal:**
+**Set as default in GNOME Terminal:**
 ```
 Preferences → Profile → Command
 → Run a custom command instead of my shell
 → /usr/local/bin/psh
 ```
-Open a new tab — you're in PSH.
 
 ## Usage
 
@@ -61,40 +60,75 @@ cd ~/projects
  what branch am i on
  compress this folder into a tar.gz
  show disk usage sorted by size
-
-# PSH shows the generated command and asks to confirm
-  ❯  find . -name "*.py" -mtime -1  [y/n]
+ create a new git repo in this folder and make an initial commit
 ```
 
-**Controls:**
-- `y` or Enter — run the suggested command
-- `n` or ESC — cancel
-- ESC while thinking — cancel the AI call immediately
-- Ctrl+D — exit PSH
+**Controls while in NL mode:**
+| Key | Action |
+|-----|--------|
+| Enter | Send query to AI |
+| ESC or Ctrl+C | Cancel |
+| Backspace | Delete last character |
+
+**Controls after AI responds:**
+| Key | Action |
+|-----|--------|
+| `y` or Enter | Run the suggested command |
+| `n`, ESC, or Ctrl+C | Cancel |
+
+**Safe read-only commands** (`ls`, `find`, `grep`, `cat`, `git status`, etc.) run immediately without asking — no `[y/n]` prompt.
+
+**Multi-step tasks** are shown as a chain and confirmed once:
+```
+  ❯  mkdir my-project
+     &&  cd my-project
+     &&  git init  [y/n]
+```
 
 ## Config
 
-PSH reads `~/.psh/config.toml` on startup. Created automatically with defaults if missing.
+`~/.psh/config.toml` — created automatically on first launch.
 
 ```toml
 underlying_shell = "/bin/bash"
 ollama_url = "http://127.0.0.1:11434"
 model = "gemma3:4b"
-confirm_commands = true   # set false to auto-run without confirming
+confirm_commands = true   # false = auto-run all commands without asking
 ```
+
+## Storage
+
+All storage lives in `~/.psh/`:
+
+| File | Contents |
+|------|----------|
+| `machine_context.txt` | Snapshot of your OS, installed tools, memory, disk — generated once on first launch and injected into every AI prompt |
+| `history.md` | Rolling last 50 entries (commands + NL prompts) — plain text, injected as context for follow-up queries |
+| `config.toml` | Your config |
+
+Nothing is sent anywhere except your local Ollama instance.
 
 ## How it works
 
-PSH intercepts a **leading space** at the prompt as a signal to enter natural language mode. Everything else passes straight through to bash unchanged.
+PSH intercepts a **leading space** at the prompt as the signal to enter NL mode. Everything else passes straight through to bash unchanged.
 
-The AI has context of your current directory, recent files, git branch, and the last 10 commands from the session — so queries like "compress it" or "run the tests again" work as expected.
+The AI receives as context:
+- Your OS, shell, current directory, and files
+- Your machine's installed tools (from `machine_context.txt`)
+- Your git branch (if in a repo)
+- The last 10 entries from `history.md`, including the original NL prompts
 
-Three response types:
-- `CMD:` — a shell command to run (shown with `[y/n]` confirm)
-- `ANSWER:` — a direct text answer (for questions like "what does this flag do?")
-- `WARN:` — a warning if the request is dangerous or not possible
+This means follow-up queries like `"compress it"`, `"run that again"`, or `"do the same for the other folder"` work as expected.
 
-## Data
+## Model quality
 
-All command history stored locally at `~/.psh/history.db` (SQLite).
-Nothing is sent anywhere except your local Ollama instance.
+`gemma3:4b` is fast but occasionally returns incorrect commands for complex queries. For better accuracy:
+
+```bash
+ollama pull llama3.1:8b
+```
+
+Then update `~/.psh/config.toml`:
+```toml
+model = "llama3.1:8b"
+```
