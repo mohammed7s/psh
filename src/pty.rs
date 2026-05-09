@@ -167,9 +167,9 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                         Mode::CollectingNl(nl_buf)
                     }
 
-                    // Ctrl+C — cancel NL input
-                    3 => {
-                        print!("^C\r\n");
+                    // Esc or Ctrl+C — cancel NL input
+                    0x1b | 3 => {
+                        print!("\r\n");
                         io::stdout().flush().ok();
                         Mode::Idle
                     }
@@ -194,7 +194,7 @@ pub fn run(config: &Config, db: &Db) -> io::Result<()> {
                         run_command(&pty_writer, &cmd, &session, db);
                         Mode::Idle
                     }
-                    b'n' | b'N' | 3 /* Ctrl+C */ => {
+                    b'n' | b'N' | 3 | 0x1b /* Ctrl+C / Esc */ => {
                         print!("n\r\ncancelled\r\n");
                         io::stdout().flush().ok();
                         Mode::Idle

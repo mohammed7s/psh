@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::context::{Db, Entry};
 use serde_json::{json, Value};
 
-fn build_system_prompt(config: &Config, recent: &[Entry]) -> String {
+fn build_system_prompt(config: &Config, _recent: &[Entry]) -> String {
     let shell = std::path::Path::new(&config.underlying_shell)
         .file_name()
         .unwrap_or_default()
@@ -15,43 +15,33 @@ fn build_system_prompt(config: &Config, recent: &[Entry]) -> String {
         .to_string_lossy()
         .to_string();
 
-    // Files in current directory
-    let files = std::process::Command::new("ls")
-        .arg("-1a")
+    let files: String = std::process::Command::new("ls")
+        .arg("-1")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(20).collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
 
-    // Git context if inside a repo
-    let git_ctx = std::process::Command::new("git")
-        .args(["status", "--short", "--branch"])
+    let git_branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
-    let history = recent.iter().rev().map(|e| {
-        format!("  [{}] $ {}\n  exit:{} output:{}", e.cwd, e.command, e.exit_code,
-            e.output.lines().next().unwrap_or(""))
-    }).collect::<Vec<_>>().join("\n");
+    let git_line = if git_branch.is_empty() {
+        String::new()
+    } else {
+        format!("Git branch: {git_branch}\n")
+    };
 
     format!(
-        "You are PSH, an AI shell assistant embedded in the terminal.\n\
-         OS: {os}\n\
-         Shell: {shell}\n\
-         Current directory: {cwd}\n\
-         Files in current directory:\n{files}\n\
-         {git}\
-         Recent session history:\n{history}\n\n\
-         Rules:\n\
-         - Return ONLY the exact command to run, nothing else\n\
-         - No markdown, no backticks, no explanation\n\
-         - Use correct syntax for {shell} on {os}\n\
-         - Use exact filenames from the file listing above when relevant\n\
-         - If the request is ambiguous or dangerous, prefix with WARN:",
-        git = if git_ctx.is_empty() { String::new() }
-              else { format!("Git status:\n{git_ctx}\n") }
+        "Translate the user's request into a single {shell} command for {os}.\n\
+         CWD: {cwd}\n\
+         Files: {files}\n\
+         {git_line}\
+         Output ONLY the command. No explanation. No markdown. No backticks.\n\
+         If dangerous or unclear, output: WARN: <reason>"
     )
 }
 
