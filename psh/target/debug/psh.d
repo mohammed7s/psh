@@ -1,0 +1,1 @@
+/home/ubuntu/Dropbox/WEB/psh/psh/target/debug/psh: /home/ubuntu/Dropbox/WEB/psh/psh/src/ai.rs /home/ubuntu/Dropbox/WEB/psh/psh/src/config.rs /home/ubuntu/Dropbox/WEB/psh/psh/src/context.rs /home/ubuntu/Dropbox/WEB/psh/psh/src/main.rs /home/ubuntu/Dropbox/WEB/psh/psh/src/pty.rs
