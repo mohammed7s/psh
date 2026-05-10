@@ -66,6 +66,7 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
          - After EXEC output, respond with another EXEC, or CMD, or ANSWER\n\
          - CMD must be valid shell — never put natural language inside CMD\n\
          - Never use WARN unless the task is genuinely impossible or destructive\n\
+         - Natural language questions (what is X, who is Y, explain Z) always use ANSWER — never WARN\n\
          \n\
          EXAMPLES:\n\
          'what is in my downloads'       → EXEC: ls -lt ~/Downloads | head -20\n\
@@ -134,6 +135,7 @@ fn call_ollama_msgs(config: &Config, messages: &[Value]) -> Option<String> {
     let body = json!({
         "model": config.model,
         "stream": false,
+        "keep_alive": "30m",
         "messages": messages
     });
 

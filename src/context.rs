@@ -39,12 +39,16 @@ impl History {
         fs::write(&self.path, trimmed).ok();
     }
 
-    /// NL prompts only, newest first (for up-arrow recall).
+    /// All history entries as display text, newest first (for up-arrow recall).
+    /// Shows NL prompt if available, otherwise the command.
     pub fn nl_prompts(&self) -> Vec<String> {
         let raw = fs::read_to_string(&self.path).unwrap_or_default();
         raw.lines()
             .filter_map(decode)
-            .filter_map(|e| e.nl_prompt)
+            .filter_map(|e| {
+                let text = e.nl_prompt.unwrap_or(e.command);
+                if text.is_empty() { None } else { Some(text) }
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .rev()

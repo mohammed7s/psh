@@ -152,10 +152,10 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         match key_rx.try_recv() {
                             Ok(c) => {
                                 rest.push(c);
-                                if rest.first() == Some(&b'[') {
-                                    if c >= 0x40 && c <= 0x7e { break; }
-                                } else {
-                                    break;
+                                match rest.first() {
+                                    Some(b'[') => { if rest.len() >= 2 && c >= 0x40 && c <= 0x7e { break; } }
+                                    Some(b'O') => { if rest.len() >= 2 { break; } }
+                                    _ => { break; }
                                 }
                             }
                             Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
@@ -167,8 +167,22 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                             // Alt+Enter on empty line: enter NL collecting mode
                             Mode::CollectingNl(Vec::new(), 0)
                         }
-                        b"[A" | b"[B" | b"[C" | b"[D" => {
-                            // Arrow keys: pass to bash readline, shadow starts empty
+                        b"[A" | b"OA" => {
+                            // Up arrow: enter NL history recall
+                            let prompts = db.nl_prompts();
+                            if !prompts.is_empty() {
+                                let p = prompts[0].clone();
+                                print!("{}", p);
+                                io::stdout().flush().ok();
+                                Mode::CollectingNl(p.into_bytes(), 1)
+                            } else {
+                                pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                                pty_writer.lock().unwrap().write_all(&rest).ok();
+                                Mode::Passthrough(Vec::new())
+                            }
+                        }
+                        b"[B" | b"OB" | b"[C" | b"OC" | b"[D" | b"OD" => {
+                            // Other arrow keys: pass to bash readline
                             pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                             pty_writer.lock().unwrap().write_all(&rest).ok();
                             Mode::Passthrough(Vec::new())
@@ -232,7 +246,20 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     pty_writer.lock().unwrap().write_all(&[b]).ok();
                     Mode::Passthrough(shadow)
                 }
-                b'\r' | 3 => {
+                b'\r' => {
+                    let cmd = String::from_utf8_lossy(&shadow).trim().to_string();
+                    if !cmd.is_empty() {
+                        db.append(&HistoryEntry {
+                            cwd:       std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+                            nl_prompt: None,
+                            command:   cmd,
+                            exit_code: 0,
+                        });
+                    }
+                    pty_writer.lock().unwrap().write_all(&[b'\r']).ok();
+                    Mode::Idle
+                }
+                3 => {
                     pty_writer.lock().unwrap().write_all(&[b]).ok();
                     Mode::Idle
                 }
@@ -245,10 +272,10 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         match key_rx.try_recv() {
                             Ok(c) => {
                                 rest.push(c);
-                                if rest.first() == Some(&b'[') {
-                                    if c >= 0x40 && c <= 0x7e { break; }
-                                } else {
-                                    break;
+                                match rest.first() {
+                                    Some(b'[') => { if rest.len() >= 2 && c >= 0x40 && c <= 0x7e { break; } }
+                                    Some(b'O') => { if rest.len() >= 2 { break; } }
+                                    _ => { break; }
                                 }
                             }
                             Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
@@ -281,8 +308,22 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                             // Nothing typed yet: enter fresh NL collecting mode
                             Mode::CollectingNl(Vec::new(), 0)
                         }
+                    } else if rest.as_slice() == b"[A" || rest.as_slice() == b"OA" {
+                        // Up arrow in Passthrough: clear line and enter NL history
+                        let prompts = db.nl_prompts();
+                        if !prompts.is_empty() {
+                            pty_writer.lock().unwrap().write_all(&[b'\x15']).ok(); // Ctrl+U clears bash line
+                            let p = prompts[0].clone();
+                            print!("{}", p);
+                            io::stdout().flush().ok();
+                            Mode::CollectingNl(p.into_bytes(), 1)
+                        } else {
+                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                            pty_writer.lock().unwrap().write_all(&rest).ok();
+                            Mode::Passthrough(shadow)
+                        }
                     } else {
-                        // Other ESC sequence (arrows, terminal queries): forward, shadow unchanged
+                        // Other ESC sequence: forward, shadow unchanged
                         pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
                         if !rest.is_empty() {
                             pty_writer.lock().unwrap().write_all(&rest).ok();
@@ -347,10 +388,10 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                         match key_rx.try_recv() {
                             Ok(c) => {
                                 rest.push(c);
-                                if rest.first() == Some(&b'[') {
-                                    if c >= 0x40 && c <= 0x7e { break; }
-                                } else {
-                                    break;
+                                match rest.first() {
+                                    Some(b'[') => { if rest.len() >= 2 && c >= 0x40 && c <= 0x7e { break; } }
+                                    Some(b'O') => { if rest.len() >= 2 { break; } }
+                                    _ => { break; }
                                 }
                             }
                             Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
@@ -381,7 +422,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                 Mode::Thinking(rx, input)
                             }
                         }
-                        b"[A" => {
+                        b"[A" | b"OA" => {
                             let prompts = db.nl_prompts();
                             let new_idx = hist_idx + 1;
                             if new_idx <= prompts.len() {
@@ -394,7 +435,7 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                 Mode::CollectingNl(nl_buf, hist_idx)
                             }
                         }
-                        b"[B" => {
+                        b"[B" | b"OB" => {
                             if hist_idx == 0 {
                                 Mode::CollectingNl(nl_buf, 0)
                             } else {
