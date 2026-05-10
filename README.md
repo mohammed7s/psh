@@ -52,7 +52,7 @@ cargo build
 
 ## Usage
 
-Type commands exactly as you normally would. To send something to the AI instead of bash, press **Ctrl+J** or **Alt+Enter** after typing.
+Type commands exactly as you normally would. To send something to the AI instead of bash, press **Alt+Enter** after typing.
 
 ```bash
 # Normal bash — just press Enter as usual
@@ -72,7 +72,7 @@ how much memory is postgres using
 
 | Key | Action |
 |-----|--------|
-| **Ctrl+J** or **Alt+Enter** | Send what you typed to the AI |
+| **Alt+Enter** | Send what you typed to the AI |
 | **Up / Down arrow** | Browse history (bash commands and NL prompts, unified) |
 | **Backspace** | Edit as normal |
 | **ESC** or **Ctrl+C** | Cancel NL mode / cancel AI query |
@@ -116,7 +116,7 @@ All storage lives in `~/.psh/` — nothing leaves your machine.
 
 ## How it works
 
-PSH wraps bash inside a PTY. Every keystroke passes through PSH first. If you press Enter, the input goes to bash as normal. If you press **Ctrl+J** or **Alt+Enter**, the input goes to the AI instead.
+PSH wraps bash inside a PTY. Every keystroke passes through PSH first. If you press Enter, the input goes to bash as normal. If you press **Alt+Enter**, the input goes to the AI instead.
 
 The AI receives as context:
 - Your OS, shell, current directory, and git branch
