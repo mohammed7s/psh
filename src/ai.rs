@@ -12,15 +12,6 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
 
-    let cwd = home.clone();
-
-    let files: String = std::process::Command::new("ls")
-        .arg("-1")
-        .arg(&home)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(20).collect::<Vec<_>>().join("  "))
-        .unwrap_or_default();
-
     let git_branch = std::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -35,17 +26,19 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
         format!("Git branch: {git_branch}\n")
     };
 
+    // Identity only: OS/distro/user/shell. Versions and disk are fetched via EXEC.
     let machine_ctx = load_machine_context();
     let machine_section = if machine_ctx.is_empty() {
         String::new()
     } else {
-        format!("Machine:\n{}\n", machine_ctx)
+        let trimmed = machine_ctx.lines().take(6).collect::<Vec<_>>().join("; ");
+        format!("Machine: {trimmed}\n")
     };
 
     let history = if recent.is_empty() {
         String::new()
     } else {
-        let lines: String = recent.iter()
+        let lines: String = recent.iter().take(5)
             .map(|e| match &e.nl_prompt {
                 Some(p) => format!("  \"{}\" → {}", p, e.command),
                 None    => format!("  $ {}", e.command),
@@ -56,31 +49,33 @@ fn build_system_prompt(config: &Config, recent: &[HistoryEntry]) -> String {
     };
 
     format!(
-        "You are PSH, a terminal AI assistant. You help users by running commands and reasoning about their output.\n\
-         OS: {os}  Shell: {shell}  CWD: {cwd}\n\
-         Home dir files: {files}\n\
+        "You are PSH, a terminal AI assistant. You help users by running shell commands and answering questions about their system.\n\
+         OS: {os}  Shell: {shell}  Home: {home}\n\
          {git_line}\
          {machine_section}\
          {history}\n\
-         You have four response types:\n\
-         EXEC: <command>   — run a read-only command to gather information, then reason about its output\n\
-         CMD: <command>    — a command for the user to run (shown on screen, user confirms)\n\
-         ANSWER: <text>    — a direct answer to the user's question\n\
-         WARN: <reason>    — if the request is dangerous or impossible\n\
+         RESPONSE TYPES (pick exactly one per reply, one line only):\n\
+         EXEC: <command>   — run a read-only shell command to gather info, then reason about its output\n\
+         CMD: <command>    — suggest a command for the user to run\n\
+         ANSWER: <text>    — answer a question directly\n\
+         WARN: <reason>    — only if the request is truly dangerous or impossible\n\
          \n\
-         Rules:\n\
-         - Use EXEC to look up information before answering (check versions, list files, read configs, etc.)\n\
-         - EXEC must be READ-ONLY — no writes, deletes, or installs\n\
-         - After EXEC output arrives, reason about it and respond with the next EXEC, CMD, or ANSWER\n\
-         - CMD must be valid shell syntax — never put natural language in CMD\n\
-         - Use && in CMD to chain steps: CMD: mkdir foo && cd foo && git init\n\
-         - ANSWER for questions; CMD for actions\n\
+         RULES:\n\
+         - ALWAYS use EXEC first for anything about files, folders, disk, memory, processes, versions, or system state\n\
+         - EXEC must be read-only (ls, find, cat, df, ps, free, git status, etc.) — never write, delete, or install\n\
+         - After EXEC output, respond with another EXEC, or CMD, or ANSWER\n\
+         - CMD must be valid shell — never put natural language inside CMD\n\
+         - Never use WARN unless the task is genuinely impossible or destructive\n\
          \n\
-         Examples:\n\
-         'how to update rust' → EXEC: rustc --version && rustup show\n\
-         'list python files'  → CMD: find . -name '*.py'\n\
-         'capital of france'  → ANSWER: Paris\n\
-         'install node'       → CMD: curl -fsSL https://fnm.vercel.app/install | bash\n\
+         EXAMPLES:\n\
+         'what is in my downloads'       → EXEC: ls -lt ~/Downloads | head -20\n\
+         'last file added to downloads'  → EXEC: ls -lt ~/Downloads | head -5\n\
+         'how much disk space left'      → EXEC: df -h ~\n\
+         'what is using most memory'     → EXEC: ps aux --sort=-%mem | head -10\n\
+         'how to update rust'            → EXEC: rustc --version && rustup show\n\
+         'list python files here'        → CMD: find . -name '*.py'\n\
+         'capital of france'             → ANSWER: Paris\n\
+         'install node'                  → CMD: curl -fsSL https://fnm.vercel.app/install | bash\n\
          \n\
          One line per response. No markdown. No explanation outside the format."
     )

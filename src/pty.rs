@@ -339,59 +339,26 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                     Mode::Idle
                 }
                 0x1b => {
-                    thread::sleep(Duration::from_micros(500));
-                    match key_rx.try_recv() {
-                        Ok(b'[') => {
-                            let mut seq = vec![b'['];
-                            let deadline = std::time::Instant::now() + Duration::from_millis(20);
-                            loop {
-                                if std::time::Instant::now() >= deadline { break; }
-                                match key_rx.try_recv() {
-                                    Ok(c) => { seq.push(c); if c >= 0x40 && c <= 0x7e { break; } }
-                                    Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
-                                    Err(_) => break,
+                    // 20ms polling loop — same as Passthrough — to reliably catch [A/[B
+                    let mut rest: Vec<u8> = Vec::new();
+                    let deadline = std::time::Instant::now() + Duration::from_millis(20);
+                    loop {
+                        if std::time::Instant::now() >= deadline { break; }
+                        match key_rx.try_recv() {
+                            Ok(c) => {
+                                rest.push(c);
+                                if rest.first() == Some(&b'[') {
+                                    if c >= 0x40 && c <= 0x7e { break; }
+                                } else {
+                                    break;
                                 }
                             }
-                            match seq.as_slice() {
-                                b"[A" => {
-                                    let prompts = db.nl_prompts();
-                                    let new_idx = hist_idx + 1;
-                                    if new_idx <= prompts.len() {
-                                        let p = prompts[new_idx - 1].clone();
-                                        for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
-                                        print!("{}", p);
-                                        io::stdout().flush().ok();
-                                        Mode::CollectingNl(p.into_bytes(), new_idx)
-                                    } else {
-                                        Mode::CollectingNl(nl_buf, hist_idx)
-                                    }
-                                }
-                                b"[B" => {
-                                    if hist_idx == 0 {
-                                        Mode::CollectingNl(nl_buf, 0)
-                                    } else {
-                                        let new_idx = hist_idx - 1;
-                                        for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
-                                        if new_idx == 0 {
-                                            io::stdout().flush().ok();
-                                            Mode::CollectingNl(vec![], 0)
-                                        } else {
-                                            let prompts = db.nl_prompts();
-                                            let p = prompts[new_idx - 1].clone();
-                                            print!("{}", p);
-                                            io::stdout().flush().ok();
-                                            Mode::CollectingNl(p.into_bytes(), new_idx)
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
-                                    pty_writer.lock().unwrap().write_all(&seq).ok();
-                                    Mode::CollectingNl(nl_buf, hist_idx)
-                                }
-                            }
+                            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(200)),
+                            Err(_) => break,
                         }
-                        Ok(b'\r') => {
+                    }
+                    match rest.as_slice() {
+                        b"\r" => {
                             // Alt+Enter while collecting: submit
                             let input = String::from_utf8_lossy(&nl_buf).trim().to_string();
                             print!("\r\n");
@@ -414,18 +381,49 @@ pub fn run(config: &Config, db: &History) -> io::Result<()> {
                                 Mode::Thinking(rx, input)
                             }
                         }
-                        Ok(other) => {
-                            print!("\r\n");
-                            io::stdout().flush().ok();
-                            pty_writer.lock().unwrap().write_all(&[0x1b, other]).ok();
-                            Mode::Idle
+                        b"[A" => {
+                            let prompts = db.nl_prompts();
+                            let new_idx = hist_idx + 1;
+                            if new_idx <= prompts.len() {
+                                let p = prompts[new_idx - 1].clone();
+                                for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
+                                print!("{}", p);
+                                io::stdout().flush().ok();
+                                Mode::CollectingNl(p.into_bytes(), new_idx)
+                            } else {
+                                Mode::CollectingNl(nl_buf, hist_idx)
+                            }
                         }
-                        Err(_) => {
-                            // ESC alone: cancel
+                        b"[B" => {
+                            if hist_idx == 0 {
+                                Mode::CollectingNl(nl_buf, 0)
+                            } else {
+                                let new_idx = hist_idx - 1;
+                                for _ in 0..nl_buf.len() { print!("\x08 \x08"); }
+                                if new_idx == 0 {
+                                    io::stdout().flush().ok();
+                                    Mode::CollectingNl(vec![], 0)
+                                } else {
+                                    let prompts = db.nl_prompts();
+                                    let p = prompts[new_idx - 1].clone();
+                                    print!("{}", p);
+                                    io::stdout().flush().ok();
+                                    Mode::CollectingNl(p.into_bytes(), new_idx)
+                                }
+                            }
+                        }
+                        [] => {
+                            // ESC alone: cancel NL mode
                             print!("\r\n");
                             io::stdout().flush().ok();
                             pty_writer.lock().unwrap().write_all(b"\r").ok();
                             Mode::Idle
+                        }
+                        other => {
+                            // Other ESC sequence: forward to bash, stay in NL mode
+                            pty_writer.lock().unwrap().write_all(&[0x1b]).ok();
+                            pty_writer.lock().unwrap().write_all(other).ok();
+                            Mode::CollectingNl(nl_buf, hist_idx)
                         }
                     }
                 }
@@ -491,6 +489,15 @@ fn show_result(
     pty_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
     db: &History,
 ) -> Mode {
+    if !nl_prompt.is_empty() {
+        db.append(&HistoryEntry {
+            cwd:       std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+            nl_prompt: Some(nl_prompt.to_string()),
+            command:   String::new(),
+            exit_code: 0,
+        });
+    }
+
     match result {
         Some(resp) if resp.starts_with("ANSWER:") => {
             print!("\r\x1b[2K\x1b[2m  {}\x1b[0m\r\n", resp[7..].trim());
